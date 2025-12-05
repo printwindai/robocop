@@ -1,0 +1,10 @@
+.build/
+build/
+install/
+log/
+.devenv/
+.vscode/
+.git/
+*.pyc
+__pycache__/
+*.swp

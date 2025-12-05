@@ -1,0 +1,13 @@
+<package format="3">
+  <name>robot_msgs</name>
+  <version>0.0.0</version>
+  <description>Messages and services for the robot</description>
+  <maintainer email="you@example.com">you</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+</package>

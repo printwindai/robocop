@@ -1,0 +1,8 @@
+# Simple demo: spin Arduino A, then B
+uint8 speed_a
+uint32 ms_a
+uint8 speed_b
+uint32 ms_b
+---
+bool ok
+string message
