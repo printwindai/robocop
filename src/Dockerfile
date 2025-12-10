@@ -39,13 +39,13 @@ WORKDIR /ws
 
 # Install system/ROS dependencies declared in your packages
 # (If you copied only manifests, run this now; otherwise this step will run after copying all sources)
-# RUN rosdep install --from-paths src --rosdistro ${ROS_DISTRO} -y --ignore-src
+# RUN rosdep install --from-paths src --rosdistro ${ROS_DISTRO} -y --ignore-src --skip-keys=ament_python
 
 # 2) Now copy your whole source tree
 COPY src/ /ws/src/
 
 # Install dependencies (safe to re-run; rosdep skips installed stuff)
-RUN rosdep install --from-paths src --rosdistro ${ROS_DISTRO} -y --ignore-src
+RUN rosdep install --from-paths src --rosdistro ${ROS_DISTRO} -y --ignore-src --skip-keys=ament_python
 
 # Build
 SHELL ["/bin/bash", "-c"]

@@ -1,147 +1,151 @@
-import time                  # Standard Python time utilities (sleep, timestamps)
-import socket                # For UDP networking to the Arduinos
+#!/usr/bin/env python3
+import time
+import socket
 
-import rclpy                 # ROS 2 Python client library
-from rclpy.node import Node  # Base class for making ROS 2 nodes
+import rclpy
+from rclpy.node import Node
 
-# Your custom message/service types from robot_msgs package
-from robot_msgs.msg import MotorArrayCmd, MotorArrayState
-from robot_msgs.srv import SpinSequence
+from robot_msgs.msg import MotorArrayState
+from robot_msgs.srv import SpinSequence   # we’ll reuse this srv name for now
 
 
-class RobotBridge(Node):                    # Define a ROS 2 node class named "RobotBridge"
+class RobotBridge(Node):
     def __init__(self):
-        super().__init__('robot_bridge')    # Initialize the Node with name "robot_bridge"
+        super().__init__('robot_bridge')
 
-        # -------- Parameters (read from YAML or use these defaults) --------
-        self.declare_parameter('mcu_a.ip', '192.168.1.120')   # IP for Arduino A
-        self.declare_parameter('mcu_a.port', 5555)            # UDP port for Arduino A
-        self.declare_parameter('mcu_b.ip', '192.168.1.121')   # IP for Arduino B
-        self.declare_parameter('mcu_b.port', 5556)            # UDP port for Arduino B
-        self.declare_parameter('watchdog_ms', 200)            # Safety timeout (ms) with no commands
+        # -------- Parameters --------
+        self.declare_parameter('mcu_a.ip', '192.168.1.190')  # IP for Arduino A
+        self.declare_parameter('mcu_a.port', 5555)           # UDP port for Arduino A
+        self.declare_parameter('mcu_b.ip', '192.168.1.121')  # IP for Arduino B
+        self.declare_parameter('mcu_b.port', 5556)           # UDP port for Arduino B
+        self.declare_parameter('watchdog_ms', 200)           # Safety timeout (ms) with no commands
 
-        # Fetch parameter values (string/int) from the node's parameter server
         ip_a = self.get_parameter('mcu_a.ip').get_parameter_value().string_value
         port_a = self.get_parameter('mcu_a.port').get_parameter_value().integer_value
         ip_b = self.get_parameter('mcu_b.ip').get_parameter_value().string_value
         port_b = self.get_parameter('mcu_b.port').get_parameter_value().integer_value
         self.watchdog_ms = self.get_parameter('watchdog_ms').get_parameter_value().integer_value
 
-        # Save addresses as (IP, port) tuples for convenience
         self.addr_a = (ip_a, port_a)
         self.addr_b = (ip_b, port_b)
 
-        # Create one UDP socket used to send packets to both Arduinos
+        # One UDP socket for both MCUs
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Track the last time each Arduino received a command (for watchdog)
         now = time.time()
         self.last_cmd_time = {'a': now, 'b': now}
 
-        # -------- Publishers (ROS topics we publish) --------
-        # Feedback topics (you can later fill with real data from the Arduinos)
-        self.pub_a = self.create_publisher(MotorArrayState, '/mcu_a/feedback', 10)  # queue size 10
+        # -------- Publishers (feedback placeholders) --------
+        self.pub_a = self.create_publisher(MotorArrayState, '/mcu_a/feedback', 10)
         self.pub_b = self.create_publisher(MotorArrayState, '/mcu_b/feedback', 10)
 
-        # -------- Subscribers (ROS topics we listen to) --------
-        # When a MotorArrayCmd arrives for A/B, send it over UDP to the right Arduino
-        self.sub_a = self.create_subscription(
-            MotorArrayCmd, '/mcu_a/cmd', self.cb_cmd_a, 10)
-        self.sub_b = self.create_subscription(
-            MotorArrayCmd, '/mcu_b/cmd', self.cb_cmd_b, 10)
+        # -------- (Optional) Command subscribers – currently unused for steppers --------
+        # You can rewire these later when you have a MotorArrayCmd definition for stepper moves.
+        # For now, they just log that they're not implemented.
+        # from robot_msgs.msg import MotorArrayCmd
+        # self.sub_a = self.create_subscription(MotorArrayCmd, '/mcu_a/cmd', self.cb_cmd_a, 10)
+        # self.sub_b = self.create_subscription(MotorArrayCmd, '/mcu_b/cmd', self.cb_cmd_b, 10)
 
-        # -------- Service (callable action) --------
-        # Expose /spin_sequence so you can trigger the “A then B” demo from the CLI
-        self.srv = self.create_service(
-            SpinSequence, '/spin_sequence', self.handle_spin_sequence)
+        # -------- Service: run sequence A then B --------
+        self.srv = self.create_service(SpinSequence, '/spin_sequence', self.handle_spin_sequence)
 
-        # -------- Timers (periodic tasks) --------
-        self.create_timer(0.05, self.timer_watchdog)   # Every 50 ms, run the watchdog
-        self.create_timer(0.1, self.timer_feedback)    # Every 100 ms, publish dummy feedback
+        # -------- Timers --------
+        self.create_timer(0.05, self.timer_watchdog)
+        self.create_timer(0.1, self.timer_feedback)
 
-        # Log a startup message with the configured addresses and watchdog
         self.get_logger().info(
-            f"RobotBridge up. A={self.addr_a}, B={self.addr_b}, watchdog={self.watchdog_ms}ms")
+            f"RobotBridge up for CNC steppers. A={self.addr_a}, B={self.addr_b}, "
+            f"watchdog={self.watchdog_ms}ms"
+        )
 
-    # ================== Helper functions to send UDP commands ==================
+    # ================== UDP helpers ==================
 
-    def speeds_to_pwm(self, speeds):
-        # Convert an array of normalized speeds (e.g., -1..1) to a single PWM (0..255).
-        # Here we just take the largest absolute value and scale it up.
-        if not speeds:
-            return 0
-        max_abs = max(abs(s) for s in speeds)
-        pwm = int(max_abs * 255)
-        pwm = max(0, min(255, pwm))  # clamp to 0..255
-        return pwm
-
-    def send_spinall(self, addr, pwm, duration_ms):
-        # Build a text command understood by the Arduino firmware and send via UDP
-        msg = f"SPINALL {pwm} {int(duration_ms)}\n".encode()
-        self.sock.sendto(msg, addr)
+    def send_move(self, addr, axis: str, steps: int, us_per_step: int):
+        """
+        Send a MOVE command understood by the new CNC/stepper firmware:
+          MOVE X <steps> <us_per_step>
+        """
+        axis = axis.upper()
+        cmd = f"MOVE {axis} {int(steps)} {int(us_per_step)}\n"
+        self.get_logger().info(f"UDP -> {addr}: {cmd.strip()}")
+        self.sock.sendto(cmd.encode(), addr)
 
     def send_stop(self, addr):
-        # Send a STOP command to immediately stop all motors on that Arduino
+        self.get_logger().debug(f"UDP -> {addr}: STOP")
         self.sock.sendto(b"STOP\n", addr)
 
-    # ================== Topic callbacks (when a command message arrives) ==================
+    # ================== (Optional) Topic callbacks – currently disabled ==================
+    # If/when you define a stepper-style MotorArrayCmd, you can re-enable these
+    # and map its fields into MOVE commands.
 
-    def cb_cmd_a(self, msg: MotorArrayCmd):
-        # Convert the MotorArrayCmd speeds to a PWM and send it to Arduino A
-        pwm = self.speeds_to_pwm(msg.speed)
-        self.send_spinall(self.addr_a, pwm, msg.duration_ms)
-        self.last_cmd_time['a'] = time.time()  # update watchdog timestamp
+    # def cb_cmd_a(self, msg: MotorArrayCmd):
+    #     self.get_logger().warn("cb_cmd_a not yet implemented for CNC steppers")
 
-    def cb_cmd_b(self, msg: MotorArrayCmd):
-        # Same as above, but for Arduino B
-        pwm = self.speeds_to_pwm(msg.speed)
-        self.send_spinall(self.addr_b, pwm, msg.duration_ms)
-        self.last_cmd_time['b'] = time.time()
+    # def cb_cmd_b(self, msg: MotorArrayCmd):
+    #     self.get_logger().warn("cb_cmd_b not yet implemented for CNC steppers")
 
-    # ================== Service handler (run “A then B” sequence) ==================
-
-# inside RobotBridge
-    def send_spin_motor(self, addr, motor_index, pwm, duration_ms):
-        self.sock.sendto(f"SPIN M{motor_index} {int(pwm)} {int(duration_ms)}\n".encode(), addr)
+    # ================== Service: sequential moves A then B ==================
 
     def handle_spin_sequence(self, req, resp):
-        pwmA, msA = int(req.speed_a or 180), int(req.ms_a or 1000)
-        pwmB, msB = int(req.speed_b or 180), int(req.ms_b or 1000)
+        """
+        We reuse the SpinSequence srv, but reinterpret its fields for steppers:
+          - req.speed_a:  steps per axis on board A   (e.g. 1000)
+          - req.ms_a:     microseconds per step on A  (e.g. 800)
+          - req.speed_b:  steps per axis on board B   (e.g. 1000)
+          - req.ms_b:     microseconds per step on B  (e.g. 800)
 
-        def do_one_board(addr, pwm, ms):
-            for i in range(3):                     # motors 0,1,2
-                self.get_logger().info(f"Seq: {addr} M{i}")
-                self.send_spin_motor(addr, i, pwm, ms)
-                time.sleep(ms/1000.0 + 0.1)        # wait for that motor to finish
-                self.send_stop(addr)               # ensure it’s stopped
+        For each board:
+          MOVE X ...
+          MOVE Y ...
+          MOVE Z ...
+        in sequence.
+        """
+        steps_a = int(req.speed_a or 1000)
+        us_a    = int(req.ms_a or 800)
+        steps_b = int(req.speed_b or 1000)
+        us_b    = int(req.ms_b or 800)
+
+        axes = ['X', 'Y', 'Z']
+
+        def do_one_board(name: str, addr, steps: int, us_per_step: int):
+            for axis in axes:
+                self.get_logger().info(
+                    f"Sequence on {name}: MOVE {axis} {steps} {us_per_step}"
+                )
+                self.send_move(addr, axis, steps, us_per_step)
+
+                # Estimated duration: each step has two edges (HIGH + LOW)
+                est_time = abs(steps) * us_per_step * 2 / 1_000_000.0
+                time.sleep(est_time + 0.25)  # add small margin
+
+                # Safety STOP after each axis
+                self.send_stop(addr)
                 time.sleep(0.05)
 
-        # A then B
-        do_one_board(self.addr_a, pwmA, msA)
-        do_one_board(self.addr_b, pwmB, msB)
+        # Run A then B
+        do_one_board("A", self.addr_a, steps_a, us_a)
+        do_one_board("B", self.addr_b, steps_b, us_b)
 
         resp.ok = True
-        resp.message = "Sequential per board complete"
+        resp.message = "Stepper sequence A then B complete"
         return resp
 
-
-    # ================== Watchdog (stop if no recent commands) ==================
+    # ================== Watchdog ==================
 
     def timer_watchdog(self):
         now = time.time()
         timeout = self.watchdog_ms / 1000.0
 
-        # If it’s been too long since last cmd for A/B, send STOP to be safe
+        # Only makes sense if we start using command topics again,
+        # but we'll keep it as a safety that periodically sends STOP.
         if now - self.last_cmd_time['a'] > timeout:
             self.send_stop(self.addr_a)
         if now - self.last_cmd_time['b'] > timeout:
             self.send_stop(self.addr_b)
 
-    # ================== Feedback publisher (placeholder) ==================
+    # ================== Feedback publisher (dummy for now) ==================
 
     def timer_feedback(self):
-        # If you later parse real feedback from Arduinos, publish it here.
-        # For now, publish zeros so the topics exist and tools can subscribe.
         msg_a = MotorArrayState()
         msg_a.measured_speed = [0.0, 0.0, 0.0]
         msg_a.status = [0, 0, 0]
@@ -154,14 +158,14 @@ class RobotBridge(Node):                    # Define a ROS 2 node class named "R
 
 
 def main(args=None):
-    rclpy.init(args=args)        # Initialize ROS 2 for Python
-    node = RobotBridge()         # Create your node instance
+    rclpy.init(args=args)
+    node = RobotBridge()
     try:
-        rclpy.spin(node)         # Keep the node running, processing callbacks
+        rclpy.spin(node)
     finally:
-        node.destroy_node()      # Clean shutdown of the node
-        rclpy.shutdown()         # Shut down ROS 2 client library
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
-    main()                       # If run as a script: start main()
+    main()

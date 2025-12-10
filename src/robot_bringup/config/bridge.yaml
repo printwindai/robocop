@@ -1,7 +1,7 @@
 robot_bridge:
   ros__parameters:
     mcu_a:
-      ip: 192.168.1.120    # set to UNO A IP
+      ip: 192.168.1.190    # set to UNO A IP
       port: 5555
     mcu_b:
       ip: 192.168.1.121    # set to UNO B IP

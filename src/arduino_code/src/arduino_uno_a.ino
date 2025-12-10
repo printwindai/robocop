@@ -1,99 +1,141 @@
-#include <WiFiS3.h>            // Include UNO R4 WiFi networking support (ESP32-S3 coprocessor)
-#include <WiFiUDP.h>           // Include UDP helper class for sending/receiving UDP packets
+#include <WiFiS3.h>
+#include <WiFiUDP.h>
 
-const char* SSID = "robot_net";       // Your Wi-Fi SSID (network name)
-const char* PASS = "strongpassword";  // Your Wi-Fi password
+const char* SSID = "BT-9FAKX7";
+const char* PASS = "ngPJgRakPLe4ab";
 
-const uint16_t UDP_PORT = 5555;       // UDP port this board listens on (A=5555, B=5556)
+const uint16_t UDP_PORT = 5555;   // Board A
 
-WiFiUDP udp;                           // Create a global UDP socket object
+WiFiUDP udp;
 
-const int MOTOR_COUNT = 3;             // Number of motors controlled by this board
-const int PWM_PINS[MOTOR_COUNT] = {5, 6, 9};  // PWM output pins for motors 0, 1, 2 (EDIT to match wiring)
-const int DIR_PINS[MOTOR_COUNT] = {4, 7, 8};  // Direction pins for motors 0, 1, 2 (EDIT to match wiring)
+// CNC Shield v3 pin mapping
+const int AXIS_COUNT = 3;
+const char AXIS_NAMES[AXIS_COUNT] = {'X', 'Y', 'Z'};
 
-unsigned long stop_at[MOTOR_COUNT] = {0, 0, 0}; // Per-motor absolute stop times (in millis since boot); 0 = inactive
+// STEP pins: X=2, Y=3, Z=4
+const int STEP_PINS[AXIS_COUNT] = {2, 3, 4};
+// DIR pins:  X=5, Y=6, Z=7
+const int DIR_PINS[AXIS_COUNT]  = {5, 6, 7};
 
-void setMotor(int i, int pwm) {        // Set motor i speed using PWM (0..255)
-  if (i < 0 || i >= MOTOR_COUNT) return;       // Ignore invalid motor index
-  pwm = constrain(pwm, 0, 255);                // Clamp PWM to 0..255 for safety
-  digitalWrite(DIR_PINS[i], HIGH);             // Fix direction to "forward" for this demo
-  analogWrite(PWM_PINS[i], pwm);               // Output PWM to the motor’s speed pin
+// ENABLE pin (active LOW)
+const int EN_PIN = 8;
+
+void enableMotors(bool enable) {
+  digitalWrite(EN_PIN, enable ? LOW : HIGH); // LOW = enable
 }
 
-void stopMotor(int i) {                 // Immediately stop motor i
-  if (i < 0 || i >= MOTOR_COUNT) return;       // Ignore invalid motor index
-  analogWrite(PWM_PINS[i], 0);                 // Set PWM to 0 (stop)
-  stop_at[i] = 0;                               // Clear its scheduled stop time
+int axisIndexFromChar(char c) {
+  c = toupper(c);
+  for (int i = 0; i < AXIS_COUNT; i++) {
+    if (AXIS_NAMES[i] == c) return i;
+  }
+  return -1;
 }
 
-void stopAll() {                         // Stop all motors
-  for (int i = 0; i < MOTOR_COUNT; i++) stopMotor(i); // Loop over all motors and stop each
-}
+// Blocking move: steps can be positive or negative
+void moveAxis(int axisIndex, long steps, unsigned int us_per_step) {
+  if (axisIndex < 0 || axisIndex >= AXIS_COUNT) return;
+  if (steps == 0) return;
 
-void setup() {                           // Arduino setup: runs once after reset/power-up
-  Serial.begin(115200);                  // Start serial port for debug prints at 115200 baud
+  int dir = (steps > 0) ? HIGH : LOW;
+  long count = labs(steps);
 
-  for (int i = 0; i < MOTOR_COUNT; i++) {   // Configure all motor pins
-    pinMode(PWM_PINS[i], OUTPUT);           // Make PWM pin an output
-    pinMode(DIR_PINS[i], OUTPUT);           // Make direction pin an output
-    stopMotor(i);                            // Ensure motor starts stopped
-    digitalWrite(DIR_PINS[i], HIGH);         // Default direction "forward"
+  int stepPin = STEP_PINS[axisIndex];
+  int dirPin  = DIR_PINS[axisIndex];
+
+  digitalWrite(dirPin, dir);
+
+  enableMotors(true);
+
+  for (long i = 0; i < count; i++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(us_per_step);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(us_per_step);
   }
 
-  WiFi.begin(SSID, PASS);                // Begin connecting to the Wi-Fi network
-  while (WiFi.status() != WL_CONNECTED) {   // Wait here until Wi-Fi connection is established
-    delay(200);                              // Brief pause between connection checks
-  }
-
-  udp.begin(UDP_PORT);                   // Start listening for UDP packets on the chosen port
-
-  Serial.print("A IP: ");                // Print a label for the IP (change to "B" on the 2nd board if you like)
-  Serial.println(WiFi.localIP());        // Print this board’s assigned IP address
-  Serial.print("A UDP port: ");          // Print a label for the UDP port
-  Serial.println(UDP_PORT);              // Print the UDP port number
+  enableMotors(false); // optional: disable between moves
 }
 
-void loop() {                            // Main loop: runs repeatedly
-  int packetSize = udp.parsePacket();    // Check if a UDP packet has arrived; returns its size (0 if none)
-  if (packetSize) {                      // If at least one packet is pending…
-    char buf[80];                        // Allocate a small buffer to hold the incoming text command
-    int len = udp.read(buf, sizeof(buf) - 1); // Read up to buffer-1 bytes from the packet
-    buf[len] = 0;                        // Null-terminate so we can treat it as a C-string
+void stopAll() {
+  // For this simple blocking implementation, STOP is just "disable drivers"
+  enableMotors(false);
+}
 
-    Serial.print("RX: "); Serial.println(buf); // DEBUG: print the received command to Serial
+void connectWiFi() {
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(SSID);
 
-    // Supported command formats:
-    //  1) "SPIN M<idx> <pwm> <ms>"    e.g. "SPIN M1 180 1500" → spin motor 1 at PWM=180 for 1500 ms
-    //  2) "SPINALL <pwm> <ms>"        e.g. "SPINALL 160 2000" → spin ALL motors for 2000 ms
-    //  3) "STOP"                      immediately stop all motors
-    if (strncmp(buf, "SPIN M", 6) == 0) {       // If command begins with "SPIN M"
-      int idx = 0, pwm = 150, dur = 1000;       // Default values in case parsing fails
-      if (sscanf(buf, "SPIN M%d %d %d", &idx, &pwm, &dur) == 3) { // Extract motor index, PWM, duration
-        if (idx >= 0 && idx < MOTOR_COUNT) {    // Check motor index is valid
-          setMotor(idx, pwm);                   // Apply the requested PWM to that motor
-          stop_at[idx] = millis() + (unsigned long)dur; // Schedule auto-stop time = now + duration
-        }
+WiFi.begin(SSID, PASS);
+
+// Wait for connection AND IP
+while (WiFi.status() != WL_CONNECTED) {
+  Serial.print(".");
+  delay(500);
+}
+
+Serial.println("\nWiFi connected!");
+
+// Force DHCP renew
+IPAddress ip = WiFi.localIP();
+while (ip == INADDR_NONE || ip.toString() == "0.0.0.0") {
+  Serial.println("Waiting for IP...");
+  delay(500);
+  ip = WiFi.localIP();
+}
+
+  Serial.println("WiFi connected!");
+  Serial.print("A IP: ");
+  Serial.println(ip);
+  Serial.print("A UDP port: ");
+  Serial.println(UDP_PORT);
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  Serial.println("Board A booting...");
+
+  // Configure pins
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, HIGH); // disable by default
+
+  for (int i = 0; i < AXIS_COUNT; i++) {
+    pinMode(STEP_PINS[i], OUTPUT);
+    pinMode(DIR_PINS[i], OUTPUT);
+    digitalWrite(STEP_PINS[i], LOW);
+    digitalWrite(DIR_PINS[i], LOW);
+  }
+
+  connectWiFi();
+  udp.begin(UDP_PORT);
+}
+
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char buf[80];
+    int len = udp.read(buf, sizeof(buf) - 1);
+    buf[len] = 0;
+
+    Serial.print("RX(A): ");
+    Serial.println(buf);
+
+    // MOVE X <steps> <us_per_step>
+    // MOVE Y <steps> <us_per_step>
+    // MOVE Z <steps> <us_per_step>
+    char axisChar;
+    long steps = 0;
+    unsigned int us_per_step = 800; // default microseconds between steps
+
+    if (sscanf(buf, "MOVE %c %ld %u", &axisChar, &steps, &us_per_step) == 3) {
+      int axisIndex = axisIndexFromChar(axisChar);
+      if (axisIndex != -1) {
+        moveAxis(axisIndex, steps, us_per_step);
       }
-    } else if (strncmp(buf, "SPINALL", 7) == 0) { // If command is "SPINALL"
-      int pwm = 150, dur = 1000;                  // Defaults
-      if (sscanf(buf, "SPINALL %d %d", &pwm, &dur) == 2) { // Extract PWM and duration
-        pwm = constrain(pwm, 0, 255);             // Clamp PWM for safety
-        unsigned long tstop = millis() + (unsigned long)dur; // Compute shared stop time once
-        for (int i = 0; i < MOTOR_COUNT; i++) {   // Apply to all motors
-          setMotor(i, pwm);                        // Set each motor to the same PWM
-          stop_at[i] = tstop;                      // Schedule the same auto-stop time
-        }
-      }
-    } else if (strncmp(buf, "STOP", 4) == 0) {   // If command is "STOP"
-      stopAll();                                  // Immediately stop every motor
-    }
-  }
-
-  unsigned long now = millis();          // Read current time in milliseconds since boot
-  for (int i = 0; i < MOTOR_COUNT; i++) {      // Check all motors for elapsed timers
-    if (stop_at[i] && now > stop_at[i]) {      // If timer is active and has expired…
-      stopMotor(i);                             // …stop that motor
+    } else if (strncmp(buf, "STOP", 4) == 0) {
+      stopAll();
     }
   }
 }
